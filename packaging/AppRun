@@ -1,0 +1,14 @@
+#!/bin/sh
+# OmaDVD-Player AppImage entry point.
+#
+# Bundled libraries take precedence, which is the whole point of the AppImage:
+# libdvdcss in particular is not installed by default on any distribution, so a
+# player that relies on the host for it is a player that fails on a fresh
+# machine. What is NOT bundled is just as deliberate -- see
+# packaging/build-appimage.sh for the exclusion list and why each entry is on it.
+HERE=$(dirname "$(readlink -f "$0")")
+export APPDIR="${APPDIR:-$HERE}"
+export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export OMADVD_ROOT="$APPDIR/usr/share/omadvd"
+export OMADVD_MPV="$APPDIR/usr/bin/mpv"
+exec "$APPDIR/usr/bin/omadvd" "$@"

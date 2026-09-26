@@ -1,0 +1,3 @@
+build/
+*.AppImage
+!packaging/*.AppImage

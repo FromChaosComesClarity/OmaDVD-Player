@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- A disc behind scanlines. Strokes are deliberately fat: this icon also
+       gets drawn on the tube, where a hairline strobes at 30Hz. -->
+  <rect width="256" height="256" rx="28" fill="#0E0E0E"/>
+  <circle cx="128" cy="128" r="84" fill="none" stroke="#F0C060" stroke-width="12"/>
+  <circle cx="128" cy="128" r="44" fill="none" stroke="#9A968C" stroke-width="10"/>
+  <circle cx="128" cy="128" r="14" fill="#0E0E0E" stroke="#EDEAE2" stroke-width="8"/>
+  <g fill="#EDEAE2" opacity="0.30">
+    <rect x="28" y="60"  width="200" height="6"/>
+    <rect x="28" y="84"  width="200" height="6"/>
+    <rect x="28" y="172" width="200" height="6"/>
+    <rect x="28" y="196" width="200" height="6"/>
+  </g>
+</svg>

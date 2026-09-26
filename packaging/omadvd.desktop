@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OmaDVD-Player
+GenericName=DVD Player
+Comment=Play a DVD on a CRT television at 480i
+Exec=omadvd
+Icon=omadvd
+Terminal=false
+Categories=AudioVideo;Video;Player;TV;
+Keywords=dvd;disc;movie;crt;tv;
+StartupNotify=false

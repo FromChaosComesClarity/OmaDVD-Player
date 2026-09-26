@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# =============================================================================
+# OmaDVD-Player — launcher.
+#
+# Finds the drive, identifies the disc, and starts mpv with OmaDVD's CRT
+# profile and interface. Everything the viewer sees comes from
+# src/lua/omadvd.lua; this script's whole job is to hand that script a disc and
+# a correct environment.
+#
+# Runs three ways, and finds its own assets in each:
+#   * from the source tree   (src/omadvd next to src/lua and src/conf)
+#   * from an AppImage       ($APPDIR/usr/bin/omadvd, assets in usr/share)
+#   * from a local install   (~/.local/bin/omadvd, assets in ~/.local/share)
+# =============================================================================
+set -uo pipefail
+
+APP_NAME="OmaDVD-Player"
+APP_ID="omadvd"
+
+die()  { printf '%s: %s\n' "$APP_ID" "$*" >&2; exit 1; }
+note() { [ -n "${OMADVD_QUIET:-}" ] || printf '%s: %s\n' "$APP_ID" "$*" >&2; }
+
+# ── Locate our own assets ────────────────────────────────────────────────────
+self=$(readlink -f "${BASH_SOURCE[0]}")
+here=$(dirname "$self")
+root=""
+for cand in \
+  "${OMADVD_ROOT:-}" \
+  "${APPDIR:-}/usr/share/$APP_ID" \
+  "$here/../share/$APP_ID" \
+  "$here"
+do
+  [ -n "$cand" ] || continue
+  if [ -f "$cand/lua/omadvd.lua" ] && [ -f "$cand/conf/mpv.conf" ]; then
+    root=$cand; break
+  fi
+done
+[ -n "$root" ] || die "cannot find my lua/ and conf/ assets (set OMADVD_ROOT)"
+
+# mpv: the bundled one inside an AppImage, otherwise whatever is on PATH.
+MPV="${OMADVD_MPV:-}"
+if [ -z "$MPV" ]; then
+  if [ -n "${APPDIR:-}" ] && [ -x "$APPDIR/usr/bin/mpv" ]; then
+    MPV="$APPDIR/usr/bin/mpv"
+  else
+    MPV=$(command -v mpv) || die "mpv not found on PATH"
+  fi
+fi
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+device="${OMADVD_DEVICE:-}"
+alang="${OMADVD_ALANG:-}"
+slang="${OMADVD_SLANG:-}"
+wait_secs=0
+do_unmount=0
+auto_title=yes
+source_arg=""
+extra=()
+
+usage() {
+  cat <<USAGE
+$APP_NAME — a DVD player for a CRT at 720x480 / 480i.
+
+Usage: $APP_ID [options] [DEVICE|IMAGE.iso|VIDEO_TS-dir] [-- mpv-args...]
+
+Options:
+  -d, --device DEV    Optical device, ISO image, or VIDEO_TS directory.
+                      Default: first drive that has a disc in it.
+  -a, --alang CODE    Preferred audio language (en, pt, es ...). A Region 4
+                      disc often defaults to Spanish; this overrides it.
+  -s, --slang CODE    Preferred subtitle language. Omit for subtitles off.
+  -w, --wait SECONDS  Wait up to SECONDS for a disc to be inserted/spun up.
+  -u, --unmount       Unmount the disc first. Not needed -- libdvdcss reads the
+                      raw device and works fine while mounted -- but available
+                      if your automounter is fighting you.
+      --no-auto-title Do not jump to the longest title; open on title 1.
+  -h, --help          This text.
+
+Environment: OMADVD_DEVICE, OMADVD_ALANG, OMADVD_SLANG, OMADVD_MPV,
+             OMADVD_ROOT, OMADVD_QUIET
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d|--device)  device=${2:?}; shift 2 ;;
+    -a|--alang)   alang=${2:?};  shift 2 ;;
+    -s|--slang)   slang=${2:?};  shift 2 ;;
+    -w|--wait)    wait_secs=${2:?}; shift 2 ;;
+    -u|--unmount) do_unmount=1; shift ;;
+    --no-auto-title) auto_title=no; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; extra=("$@"); break ;;
+    -*)           die "unknown option: $1 (try --help)" ;;
+    *)            source_arg=$1; shift ;;
+  esac
+done
+[ -n "$source_arg" ] && device=$source_arg
+
+# ── Find a drive ─────────────────────────────────────────────────────────────
+# A drive with a disc in it reports a non-zero size; an empty one reports 0.
+has_disc() {
+  local dev=$1
+  [ -b "$dev" ] || return 1
+  local sz
+  sz=$(lsblk -bdno SIZE "$dev" 2>/dev/null) || return 1
+  [ -n "$sz" ] && [ "$sz" -gt 0 ] 2>/dev/null
+}
+
+find_drive() {
+  local d
+  for d in /dev/sr[0-9]* /dev/cdrom /dev/dvd; do
+    [ -e "$d" ] || continue
+    if has_disc "$(readlink -f "$d")"; then readlink -f "$d"; return 0; fi
+  done
+  return 1
+}
+
+if [ -z "$device" ]; then
+  deadline=$(( $(date +%s) + wait_secs ))
+  while : ; do
+    if device=$(find_drive); then break; fi
+    [ "$(date +%s)" -lt "$deadline" ] || break
+    sleep 1
+  done
+  [ -n "$device" ] || die "no disc found in any optical drive"
+fi
+
+# ── Identify the disc ────────────────────────────────────────────────────────
+label=""
+disc_id=""
+if [ -b "$device" ]; then
+  has_disc "$device" || {
+    if [ "$wait_secs" -gt 0 ]; then
+      note "waiting up to ${wait_secs}s for a disc in $device"
+      deadline=$(( $(date +%s) + wait_secs ))
+      until has_disc "$device"; do
+        [ "$(date +%s)" -lt "$deadline" ] || die "no disc in $device"
+        sleep 1
+      done
+    else
+      die "no disc in $device"
+    fi
+  }
+  # lsblk reads the udev database, so this needs no privileges. For a video DVD
+  # the UUID *is* the disc's own serial number -- a stable per-disc key, which
+  # is exactly what the resume store needs (mpv's own watch-later cannot help:
+  # every disc has the identical "filename", dvdnav://).
+  label=$(lsblk -dno LABEL  "$device" 2>/dev/null | sed -e 's/[[:space:]]*$//')
+  disc_id=$(lsblk -dno UUID "$device" 2>/dev/null | tr -d '[:space:]')
+
+  if [ "$do_unmount" = 1 ]; then
+    mnt=$(lsblk -dno MOUNTPOINT "$device" 2>/dev/null)
+    if [ -n "$mnt" ]; then
+      note "unmounting $device"
+      udisksctl unmount -b "$device" >/dev/null 2>&1 || note "unmount failed; continuing"
+    fi
+  fi
+elif [ -d "$device" ]; then
+  # A VIDEO_TS tree, or its parent.
+  [ -d "$device/VIDEO_TS" ] && device="$device"
+  label=$(basename "$device")
+  disc_id="dir-$(printf '%s' "$device" | cksum | tr -d ' ')"
+elif [ -f "$device" ]; then
+  label=$(basename "$device"); label=${label%.*}
+  disc_id="iso-$(printf '%s' "$device" | cksum | tr -d ' ')"
+else
+  die "not a device, image, or directory: $device"
+fi
+[ -n "$label" ] || label="DVD"
+
+# The label is a human string off a disc pressed decades ago; make it readable
+# and make it safe for --script-opts, where a comma would split the option.
+pretty=$(printf '%s' "$label" | tr '_' ' ' | tr -s ' ' | sed -e 's/,/ /g')
+disc_id=${disc_id:-unknown}
+
+note "disc: $pretty  [$disc_id]  on $device"
+
+# ── Warn about the one dependency people actually hit ────────────────────────
+# Without libdvdcss every commercial disc fails with "Error reading NAV packet",
+# which looks like a broken drive or a scratched disc rather than a missing
+# library. Say so plainly before mpv gets a chance to be cryptic.
+if [ -z "${APPDIR:-}" ]; then
+  have_css=0
+  ldconfig -p 2>/dev/null | grep -q 'libdvdcss\.so' && have_css=1
+  # ldconfig's cache can lag a just-finished install, so fall back to looking
+  # for the file itself rather than crying wolf at someone who just ran pacman.
+  if [ "$have_css" = 0 ]; then
+    for d in /usr/lib /usr/lib64 /usr/local/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu; do
+      [ -e "$d/libdvdcss.so.2" ] && { have_css=1; break; }
+    done
+  fi
+  if [ "$have_css" = 0 ]; then
+    note "WARNING: libdvdcss is not installed. Encrypted (i.e. nearly every"
+    note "         commercial) DVD will fail to read. On Arch/Omarchy:"
+    note "           sudo pacman -S libdvdcss"
+  fi
+fi
+
+# ── Go ───────────────────────────────────────────────────────────────────────
+opts="omadvd-disc_id=${disc_id},omadvd-disc_label=${pretty}"
+opts="${opts},omadvd-auto_main_title=${auto_title}"
+[ -n "$alang" ] && opts="${opts},omadvd-prefer_alang=${alang}"
+[ -n "$slang" ] && opts="${opts},omadvd-prefer_slang=${slang}"
+
+# --no-config is deliberate: the player must behave identically on any machine,
+# never inheriting a ~/.config/mpv tuned for a desktop monitor.
+exec "$MPV" \
+  --no-config \
+  --include="$root/conf/mpv.conf" \
+  --input-conf="$root/conf/input.conf" \
+  --script="$root/lua/omadvd.lua" \
+  --script-opts="$opts" \
+  --dvd-device="$device" \
+  --title="$APP_NAME" \
+  --wayland-app-id="$APP_ID" \
+  --wayland-content-type=video \
+  --pause=yes \
+  "${extra[@]}" \
+  "dvdnav://"
