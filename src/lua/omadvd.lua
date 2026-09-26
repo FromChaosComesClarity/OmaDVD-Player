@@ -50,6 +50,49 @@ local o = {
 }
 options.read_options(o, "omadvd")
 
+-- The launcher hands us the disc it found, but a disc is not a launch-time
+-- constant: the viewer can eject one and put another in without leaving the
+-- player, and everything keyed on disc identity (the resume file, the header)
+-- has to follow. These are refreshed on every load.
+local disc_id    = o.disc_id or ""
+local disc_label = o.disc_label or ""
+
+local function shell_async(args, cb)
+  mp.command_native_async(
+    { name = "subprocess", args = args, capture_stdout = true, playback_only = false },
+    function(ok, res)
+      if cb then cb(ok and res ~= nil and res.status == 0, (res and res.stdout) or "") end
+    end)
+end
+
+local function device()
+  local d = mp.get_property("dvd-device")
+  if not d or d == "" then return "/dev/sr0" end
+  return d
+end
+
+-- ⚠️ `-P` (key="value") rather than plain columns: a disc label can contain
+-- spaces, and CONQUEST OF PLANET OF THE APES parsed positionally is four
+-- fields of nonsense.
+--
+-- ⚠️ And do NOT use SIZE to decide whether a disc is present. With the tray
+-- open this drive still reports the last disc's size -- 7594151936 with
+-- LABEL="" UUID="" -- so a size test says "disc!" at an empty open tray and the
+-- player sits there failing to open it every two seconds. UUID and LABEL do go
+-- empty, so they are the honest signal. A disc still spinning up reads empty
+-- too, which costs one more two-second poll and nothing else.
+local function probe_disc(cb)
+  shell_async({ "lsblk", "-dn", "-b", "-P", "-o", "LABEL,UUID,SIZE", device() },
+    function(ok, out)
+      if not ok then cb(nil) return end
+      local label = out:match('LABEL="(.-)"') or ""
+      local uuid  = out:match('UUID="(.-)"')  or ""
+      local size  = tonumber(out:match('SIZE="(%d*)"') or "0") or 0
+      cb({ label = label, uuid = uuid, size = size,
+           present = (uuid ~= "" or label ~= "") and size > 0 })
+    end)
+end
+
 -- ---------------------------------------------------------------------------
 -- Palette
 --
@@ -276,14 +319,14 @@ local function state_dir()
 end
 
 local function resume_path()
-  local id = o.disc_id
-  if id == "" then id = "unknown" end
+  local id = disc_id
+  if id == nil or id == "" then id = "unknown" end
   id = id:gsub("[^%w%-_%.]", "_")
   return state_dir() .. "/resume-" .. id .. ".txt"
 end
 
 local function read_resume()
-  if o.disc_id == "" then return nil end
+  if disc_id == nil or disc_id == "" then return nil end
   local f = io.open(resume_path(), "r")
   if not f then return nil end
   local t = {}
@@ -297,7 +340,7 @@ local function read_resume()
 end
 
 local function save_resume()
-  if o.disc_id == "" then return end
+  if disc_id == nil or disc_id == "" then return end
   local pos = mp.get_property_number("time-pos")
   local ed  = mp.get_property_number("edition")
   -- Below a minute there is nothing worth coming back to, and near the end the
@@ -316,7 +359,7 @@ local function save_resume()
     pos, ed or 0,
     tostring(mp.get_property("aid") or "auto"),
     tostring(mp.get_property("sid") or "no"),
-    o.disc_label))
+    disc_label))
   f:close()
 end
 
@@ -386,18 +429,27 @@ end
 -- UI state
 -- ---------------------------------------------------------------------------
 local ui = {
-  mode  = "hidden",   -- hidden | menu | osd | blank
+  mode  = "hidden",   -- hidden | menu | osd | loading | blank
   stack = {},         -- breadcrumb of menu ids
   sel   = {},         -- per-menu selection, so going back returns to your row
   rows  = {},
   title = "",
   osd_until = 0,
-  paused_since = nil,
+  last_input = 0,     -- drives burn-in blanking; a menu idles just like a pause
+  blank_from = nil,   -- the mode to restore when the screen wakes
   drift = 0,
 }
 
-local render            -- forward declaration
-local osd_timer, tick_timer
+local render                       -- forward declaration
+local show_nodisc, load_disc       -- defined once the menus exist
+local osd_timer, tick_timer, disc_timer
+local ui_started   = false
+local ejecting     = false
+local loading_disc = false
+-- Give up auto-loading after this many consecutive read failures of the same
+-- disc, or an unreadable one turns the waiting screen into a retry loop.
+local LOAD_TRIES = 3
+local load_fail  = { id = "", n = 0 }
 
 local function flash_osd()
   if ui.mode == "menu" then return end
@@ -435,14 +487,20 @@ local function play_title(i, at)
   mp.set_property_bool("pause", false)
 end
 
+-- Eject used to quit. It should not: swapping discs is the one thing a DVD
+-- player is expected to do without being restarted.
+--
+-- ⚠️ Order matters. `stop` first, because while a title is loaded libdvdnav
+-- holds the device open and the tray will not budge -- the eject simply fails,
+-- silently, and looks like broken hardware.
 local function eject()
   save_resume()
-  local dev = mp.get_property("dvd-device")
-  mp.command_native({ name = "subprocess", playback_only = false, detach = true,
-                      args = { "sh", "-c",
-                               string.format("sleep 0.4; eject %q >/dev/null 2>&1",
-                                             dev ~= "" and dev or "/dev/sr0") } })
-  mp.command("quit")
+  ejecting = true
+  mp.command("stop")
+  show_nodisc()
+  mp.add_timeout(0.5, function()
+    shell_async({ "eject", device() }, function() ejecting = false end)
+  end)
 end
 
 local function cycle_deint(d)
@@ -493,7 +551,7 @@ menus.main = function()
   rows[#rows + 1] = { label = "Quit",       detail = "", act = function()
     save_resume(); mp.command("quit")
   end }
-  return rows, (o.disc_label ~= "" and o.disc_label or "DVD")
+  return rows, (disc_label ~= "" and disc_label or "DVD")
 end
 
 menus.titles = function()
@@ -581,6 +639,28 @@ menus.picture = function()
   }, "Picture"
 end
 
+-- Shown while the tray is empty. Everything here is reachable with the same
+-- four arrows and two buttons as the rest, because "put another disc in" is a
+-- thing you do from the sofa, not from a terminal.
+menus.nodisc = function()
+  local rows = {}
+  if load_fail.n >= LOAD_TRIES then
+    rows[#rows + 1] = { label = "Try again", detail = "", act = function()
+      load_fail.n = 0
+      load_disc()
+    end }
+  end
+  -- Only a motorised tray obeys this. Most slim USB drives eject under power
+  -- and close by hand, so the row is offered without being promised -- the
+  -- watcher picks the disc up either way.
+  rows[#rows + 1] = { label = "Close tray", detail = "if motorised", keep = true,
+                      act = function() shell_async({ "eject", "-t", device() }) end }
+  rows[#rows + 1] = { label = "Eject",      detail = "", keep = true,
+                      act = function() shell_async({ "eject", device() }) end }
+  rows[#rows + 1] = { label = "Quit",       detail = "", act = function() mp.command("quit") end }
+  return rows, (load_fail.n >= LOAD_TRIES) and "Cannot read that disc" or "No disc"
+end
+
 local function rebuild()
   local id = ui.stack[#ui.stack] or "main"
   local rows, title = (menus[id] or menus.main)()
@@ -604,6 +684,37 @@ local function show_menu()
   ui.stack = {}
   ui.mode = "menu"
   open_menu("main")
+end
+
+show_nodisc = function()
+  ui.stack = { "nodisc" }
+  ui.sel["nodisc"] = 1
+  rebuild()
+  ui.mode = "menu"
+  ui.last_input = mp.get_time()
+  render()
+end
+
+-- Identify whatever is in the drive now, then load it. Everything keyed on the
+-- disc -- resume file, header, titles -- is reset here, because the disc in the
+-- drive is not the disc we started with.
+load_disc = function()
+  if loading_disc then return end
+  loading_disc = true
+  probe_disc(function(info)
+    if not info or not info.present then loading_disc = false return end
+    if info.uuid ~= load_fail.id then load_fail = { id = info.uuid, n = 0 } end
+    disc_id    = (info.uuid ~= "" and info.uuid) or "unknown"
+    local lab  = (info.label ~= "" and info.label or "DVD"):gsub("_", " ")
+    disc_label = lab:gsub("%s+", " ")
+    src_dar      = nil
+    ui_started   = false
+    disc.titles  = {}
+    disc.main    = nil
+    ui.mode = "loading"
+    render()
+    mp.commandv("loadfile", "dvdnav://")
+  end)
 end
 
 local function close_menu(resume_play)
@@ -647,7 +758,7 @@ local function draw_osd(a)
 
   local ty = y + M.pad
   local ed = mp.get_property_number("current-edition")
-  local head = (o.disc_label ~= "" and o.disc_label or "DVD")
+  local head = (disc_label ~= "" and disc_label or "DVD")
   if ed then head = head .. "   Title " .. (ed + 1) end
   local ch = mp.get_property_number("chapter")
   if ch and ch >= 0 then head = head .. "   Chapter " .. (ch + 1) end
@@ -707,12 +818,25 @@ local function draw_menu(a)
     text(a, M.x1 - M.pad, M.y1 - M.foot_h, 9, M.fs_small, COL.dim,
          string.format("%d/%d", sel, #ui.rows))
   end
-  text(a, M.x0 + M.pad, M.y1 - M.foot_h, 7, M.fs_small, COL.dim,
-       (#ui.stack > 1) and "Enter select    Esc back" or "Enter select    Esc close")
+  local hint
+  if id == "nodisc" then hint = "Insert a disc -- it loads by itself"
+  elseif #ui.stack > 1 then hint = "Enter select    Esc back"
+  else hint = "Enter select    Esc close" end
+  text(a, M.x0 + M.pad, M.y1 - M.foot_h, 7, M.fs_small, COL.dim, hint)
 end
 
 render = function()
   measure()
+  -- Publish what is on screen. mpv exposes user-data over the IPC socket, so
+  -- `{"command":["get_property","user-data/omadvd"]}` answers "what is the
+  -- player showing right now" without a screenshot -- which is the only way to
+  -- check the no-disc screen, since mpv cannot screenshot with no file loaded.
+  mp.set_property_native("user-data/omadvd", {
+    mode  = ui.mode,
+    menu  = ui.stack[#ui.stack] or "",
+    disc  = disc_label,
+    rows  = #ui.rows,
+  })
   local a = {}
   if ui.mode == "blank" then
     draw_blank(a)
@@ -737,9 +861,11 @@ end
 -- couch keyboard drive the whole player without a modifier in sight.
 -- ---------------------------------------------------------------------------
 local function wake()
+  ui.last_input = mp.get_time()
   if ui.mode == "blank" then
-    ui.mode = "hidden"
-    wipe()
+    ui.mode = ui.blank_from or "hidden"
+    ui.blank_from = nil
+    if ui.mode == "hidden" then wipe() else render() end
     return true
   end
   return false
@@ -775,6 +901,9 @@ local function activate()
 end
 
 local function back()
+  -- There is nothing behind the no-disc screen; closing it would leave a black
+  -- screen and no way back.
+  if ui.stack[1] == "nodisc" then return end
   if #ui.stack > 1 then
     table.remove(ui.stack)
     rebuild()
@@ -786,6 +915,7 @@ end
 
 local function bind(key, name, fn, rep)
   mp.add_forced_key_binding(key, "omadvd-" .. name, function()
+    ui.last_input = mp.get_time()
     if wake() then return end
     fn()
   end, rep and { repeatable = true } or nil)
@@ -847,18 +977,31 @@ bind("e", "eject", eject)
 -- ---------------------------------------------------------------------------
 tick_timer = mp.add_periodic_timer(1, function()
   local paused = mp.get_property_bool("pause")
-  if paused and ui.mode ~= "menu" and ui.mode ~= "loading" then
-    ui.paused_since = ui.paused_since or mp.get_time()
-    if mp.get_time() - ui.paused_since >= o.blank_after then
-      if ui.mode ~= "blank" then ui.mode = "blank"; ui.drift = 0 end
-      ui.drift = ui.drift + 1
-      render()
-      return
+  local idle   = mp.get_property("idle-active") == "yes"
+
+  -- Blank whenever nothing on screen is moving and nobody has touched a key:
+  -- paused, sitting on a menu, or waiting for a disc. The original version only
+  -- covered a paused frame, but a menu left up overnight burns in exactly the
+  -- same way -- and with the no-disc screen there is now a state that can sit
+  -- there for days.
+  if (paused or idle) and ui.mode ~= "loading"
+     and (mp.get_time() - ui.last_input) >= o.blank_after then
+    if ui.mode ~= "blank" then
+      ui.blank_from = ui.mode
+      ui.mode = "blank"
+      ui.drift = 0
     end
-  else
-    ui.paused_since = nil
-    if ui.mode == "blank" then ui.mode = "hidden"; wipe() end
+    ui.drift = ui.drift + 1
+    render()
+    return
   end
+
+  if ui.mode == "blank" then
+    ui.mode = ui.blank_from or "hidden"
+    ui.blank_from = nil
+    if ui.mode == "hidden" then wipe() end
+  end
+
   if ui.mode == "loading" then
     render()
   elseif ui.mode == "osd" then
@@ -872,11 +1015,29 @@ tick_timer = mp.add_periodic_timer(1, function()
   end
 end)
 
+-- ── Waiting for a disc ──────────────────────────────────────────────────────
+-- Polling rather than udev: two seconds of latency is imperceptible next to the
+-- time a tray takes to close and a drive takes to spin up, and `lsblk` reads
+-- the udev database anyway, so this costs nothing and needs no daemon.
+disc_timer = mp.add_periodic_timer(2, function()
+  if ui.stack[1] ~= "nodisc" then return end
+  if ejecting or loading_disc then return end
+  probe_disc(function(info)
+    if not info then return end
+    if not info.present then
+      -- Tray open or empty: forget any past failure, so the next disc starts
+      -- with a clean slate.
+      if load_fail.n > 0 and load_fail.id ~= "" then load_fail = { id = "", n = 0 } end
+      return
+    end
+    if info.uuid == load_fail.id and load_fail.n >= LOAD_TRIES then return end
+    load_disc()
+  end)
+end)
+
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
-local ui_started  = false
-local title_fixed = false
 
 local function pick_lang(kind, prop, want)
   if want == "" then return end
@@ -889,6 +1050,7 @@ local function pick_lang(kind, prop, want)
 end
 
 mp.register_event("file-loaded", function()
+  loading_disc = false
   measure()
   read_titles()
   src_dar = read_src_dar()
@@ -933,15 +1095,36 @@ mp.observe_property("osd-dimensions", "native", function()
   if ui.mode ~= "hidden" then render() end
 end)
 
-mp.register_event("end-file", function()
+mp.register_event("end-file", function(ev)
+  loading_disc = false
+  -- Our own stop(), on the way to opening the tray. show_nodisc() already ran.
+  if ejecting then return end
+
+  local reason = ev and ev.reason
+  if reason == "error" then
+    -- A disc that will not read. Count it, so the waiting screen does not sit
+    -- in a two-second retry loop forever.
+    load_fail.n = load_fail.n + 1
+    show_nodisc()
+    return
+  end
+
   -- A finished title returns to the menu; the player is the place you sit.
   if ui_started then
     mp.add_timeout(0.2, function()
-      if mp.get_property("idle-active") ~= "yes" then show_menu() end
+      if mp.get_property("idle-active") == "yes" then show_nodisc() else show_menu() end
     end)
   end
 end)
 
 mp.register_event("shutdown", function() save_resume() end)
 
-msg.info("OmaDVD-Player UI ready; disc=" .. (o.disc_label ~= "" and o.disc_label or "?"))
+ui.last_input = mp.get_time()
+
+-- Started with an empty drive or an open tray: there is no file-loaded event
+-- coming, so open the waiting screen directly. The watcher takes it from there.
+mp.add_timeout(0.3, function()
+  if not ui_started and mp.get_property("idle-active") == "yes" then show_nodisc() end
+end)
+
+msg.info("OmaDVD-Player UI ready; disc=" .. (disc_label ~= "" and disc_label or "?"))

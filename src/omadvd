@@ -116,6 +116,17 @@ find_drive() {
   return 1
 }
 
+# Fall back to any optical device at all, disc or no disc. Starting with an
+# empty drive is not an error -- the player opens on its "No disc" screen and
+# loads whatever gets put in.
+any_drive() {
+  local d
+  for d in /dev/sr[0-9]* /dev/cdrom /dev/dvd; do
+    [ -e "$d" ] && { readlink -f "$d"; return 0; }
+  done
+  return 1
+}
+
 if [ -z "$device" ]; then
   deadline=$(( $(date +%s) + wait_secs ))
   while : ; do
@@ -123,33 +134,38 @@ if [ -z "$device" ]; then
     [ "$(date +%s)" -lt "$deadline" ] || break
     sleep 1
   done
-  [ -n "$device" ] || die "no disc found in any optical drive"
+  if [ -z "$device" ]; then
+    device=$(any_drive) || die "no optical drive found at all"
+  fi
 fi
 
 # ── Identify the disc ────────────────────────────────────────────────────────
 label=""
 disc_id=""
+start_disc=1
 if [ -b "$device" ]; then
-  has_disc "$device" || {
-    if [ "$wait_secs" -gt 0 ]; then
-      note "waiting up to ${wait_secs}s for a disc in $device"
-      deadline=$(( $(date +%s) + wait_secs ))
-      until has_disc "$device"; do
-        [ "$(date +%s)" -lt "$deadline" ] || die "no disc in $device"
-        sleep 1
-      done
-    else
-      die "no disc in $device"
-    fi
-  }
+  if ! has_disc "$device" && [ "$wait_secs" -gt 0 ]; then
+    note "waiting up to ${wait_secs}s for a disc in $device"
+    deadline=$(( $(date +%s) + wait_secs ))
+    until has_disc "$device"; do
+      [ "$(date +%s)" -lt "$deadline" ] || break
+      sleep 1
+    done
+  fi
   # lsblk reads the udev database, so this needs no privileges. For a video DVD
   # the UUID *is* the disc's own serial number -- a stable per-disc key, which
   # is exactly what the resume store needs (mpv's own watch-later cannot help:
   # every disc has the identical "filename", dvdnav://).
+  #
+  # ⚠️ Do not test SIZE for disc-present. With the tray open this drive still
+  # reports the last disc's size while LABEL and UUID go empty, so size alone
+  # says "disc!" at an open tray.
   label=$(lsblk -dno LABEL  "$device" 2>/dev/null | sed -e 's/[[:space:]]*$//')
   disc_id=$(lsblk -dno UUID "$device" 2>/dev/null | tr -d '[:space:]')
-
-  if [ "$do_unmount" = 1 ]; then
+  if [ -z "$label" ] && [ -z "$disc_id" ]; then
+    note "no disc in $device -- opening on the waiting screen"
+    start_disc=0
+  elif [ "$do_unmount" = 1 ]; then
     mnt=$(lsblk -dno MOUNTPOINT "$device" 2>/dev/null)
     if [ -n "$mnt" ]; then
       note "unmounting $device"
@@ -205,6 +221,10 @@ opts="${opts},omadvd-auto_main_title=${auto_title}"
 
 # --no-config is deliberate: the player must behave identically on any machine,
 # never inheriting a ~/.config/mpv tuned for a desktop monitor.
+# With no disc, mpv is started idle and with no file at all: omadvd.lua opens
+# on its waiting screen and loads whatever is inserted.
+if [ "$start_disc" = 1 ]; then set -- "dvdnav://"; else set -- ; fi
+
 exec "$MPV" \
   --no-config \
   --include="$root/conf/mpv.conf" \
@@ -217,4 +237,4 @@ exec "$MPV" \
   --wayland-content-type=video \
   --pause=yes \
   "${extra[@]}" \
-  "dvdnav://"
+  "$@"

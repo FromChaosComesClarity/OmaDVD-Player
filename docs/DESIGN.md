@@ -123,13 +123,70 @@ mpv's own watch-later cannot help: every disc presents the identical
 **serial number** (`2ace76ac00000000` ↔ libdvdnav's reported `2ACE76AC`),
 without root, straight from the udev database. That is the resume key.
 
+## 7a. Swapping discs without leaving the player
+
+Eject originally quit the player. That was simply wrong: changing discs is the
+one thing a DVD player exists to let you do without being restarted. Four
+things had to be true to fix it, and three of them are not obvious.
+
+**Stop before ejecting.** While a title is loaded libdvdnav holds the device
+open and the tray does not move. The eject fails silently and looks like broken
+hardware.
+
+**`force-window=yes`.** With no file loaded mpv destroys its window, and the
+window is where the waiting screen is drawn. Without this, ejecting blacks the
+screen out entirely and there is nothing left to put a menu on.
+
+**⚠️ Do not use SIZE to decide whether a disc is present.** With the tray open
+this drive still reports the last disc's size:
+
+```
+LABEL="" UUID="" SIZE="7594151936"     # tray open, nothing in it
+```
+
+A size test therefore says "disc!" at an empty open tray, and the player sits
+there failing to open it every two seconds. `UUID` and `LABEL` do both go
+empty, so they are the honest signal. A disc still spinning up also reads
+empty, which costs one extra poll and nothing else.
+
+**Polling, not udev.** Two seconds of latency is imperceptible next to how long
+a tray takes to close and a drive takes to spin up, and `lsblk` reads the udev
+database anyway — so this needs no daemon and no privileges.
+
+Consecutive read failures of the *same* disc are counted, and auto-loading
+stops after three, because otherwise an unreadable disc turns the waiting
+screen into a silent two-second retry loop. A different disc resets the count.
+
+Starting with an empty drive follows the same path: the launcher no longer
+refuses to run, it starts mpv idle with no file and lets the waiting screen
+pick things up.
+
+`eject -t` closes only a motorised tray. Most slim USB drives are push-to-close,
+so the menu row is offered without being promised.
+
+## 7b. Checking the UI without a screenshot
+
+mpv cannot take a screenshot with no file loaded, which is exactly the state the
+waiting screen lives in — and on a single-screen machine a compositor overlay
+can cover the window anyway. So the script publishes what it is showing:
+
+```sh
+echo '{"command":["get_property","user-data/omadvd"]}' | socat - /path/to.sock
+# {"rows":3,"menu":"nodisc","disc":"DVD","mode":"menu"}
+```
+
+Cheap, and it makes the player scriptable as a side effect.
+
 ## 8. Burn-in
 
 A paused DVD is a bright still image held indefinitely — the worst thing you
 can do to a phosphor. OmaCRT's own screensaver cannot cover this: it is
 deliberately vetoed by a fullscreen window, and OmaDVD is always fullscreen.
-So OmaDVD blanks itself after 4 minutes paused, with a label that drifts so
-even the label cannot burn in.
+So OmaDVD blanks itself after 4 minutes with no keypress, with a label that
+drifts so even the label cannot burn in. Note *no keypress*, not *paused*: the
+first version only covered a paused frame, but a menu left up overnight burns
+in exactly the same way — and the waiting screen is a state that can sit there
+for days.
 
 The Wayland idle protocol would not have helped either: it counts seat input,
 and a paused player with nobody touching a key looks the same as an empty room.

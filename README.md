@@ -104,8 +104,14 @@ A Region 4 disc often defaults to Spanish and a Region 2 one to German; `-a en`
 | `d` | — | cycle deinterlacer |
 | `e` / `q` | eject / quit | eject / quit |
 
+Ejecting does **not** close the player. The screen switches to *No disc*, and
+whatever you put in next is detected and loaded on its own — so a double
+feature is two discs, not two launches. Starting with an empty drive opens on
+the same waiting screen rather than refusing to run.
+
 Resume is per-disc, keyed on the disc's own serial number, so a half-watched
-film picks up where it stopped even after other discs in between.
+film picks up where it stopped even after other discs in between — including
+discs swapped without leaving the player.
 
 ## Build
 

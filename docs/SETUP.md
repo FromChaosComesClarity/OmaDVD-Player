@@ -92,6 +92,17 @@ The track is 5.1 downmixed to stereo. Turn on **Audio ▸ Night mode**.
 Working as designed — burn-in protection after 4 minutes. Any key wakes it.
 Change with `--script-opts=omadvd-blank_after=600`.
 
+**The tray opens but "Close tray" does nothing**
+Most slim USB drives eject under power and close by hand — the motor only goes
+one way. Push it shut; the disc is picked up within a couple of seconds either
+way. The row is there for the drives that do obey it.
+
+**A disc is in but the player still says "No disc"**
+It polls every two seconds and a drive can take longer than that to spin up and
+publish its label. If it stays that way, check `lsblk -dn -P -o LABEL,UUID
+/dev/sr0` reports something — an empty UUID *and* an empty label is how OmaDVD
+decides the tray is empty.
+
 **Playback is fine but nothing is on screen for several seconds after choosing
 a title**
 Expected: changing title reloads the encrypted stream and re-fetches CSS keys.
