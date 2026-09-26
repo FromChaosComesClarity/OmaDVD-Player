@@ -41,6 +41,36 @@ Everything is one list of large rows, navigable with four arrows and two
 buttons — so the same interface works from a keyboard on the arm of the sofa
 or from a gamepad through OmaCRT's input daemon, with no modifier keys.
 
+## Cover art and metadata
+
+If the machine is online, OmaDVD looks the disc up and shows a cover, year,
+runtime, IMDb id and synopsis on an **About this disc** screen — and uses the
+real title in the menu heading, so the menu says *Conquest of the Planet of the
+Apes* rather than `CONQUEST OF PLANET OF THE APES`.
+
+No API key, no account. It searches Wikipedia with the volume label, which is
+forgiving enough to cope with the labels discs actually carry — that one is
+missing a "the" and still resolves. Wikidata supplies year, runtime and the
+IMDb id; the poster comes off the article.
+
+Everything is cached per disc under `~/.local/state/omadvd/meta/`, keyed on the
+**disc's own serial number**, so it is fetched once and works offline forever
+after. The lookup is fully asynchronous — nothing in the player ever waits on
+the network, and with no connection it simply carries on.
+
+A disc whose label is hopeless (`DREAMTHEATER`) can be named by hand, once:
+
+```sh
+echo "Dream Theater Live at Budokan" > ~/.local/state/omadvd/meta/<serial>.name
+```
+
+The serial is in the same folder's filenames, and `lsblk -dno UUID /dev/sr0`
+prints it. Drop your own `<serial>.jpg` there instead if you would rather
+supply the cover yourself. `--offline` disables lookups entirely; cached
+results still show.
+
+Only the volume label ever leaves the machine, and only to Wikipedia.
+
 ## The CRT parts that are not cosmetic
 
 **Aspect.** The one thing almost every DVD setup gets wrong on a tube. A

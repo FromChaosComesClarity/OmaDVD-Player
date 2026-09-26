@@ -177,6 +177,76 @@ echo '{"command":["get_property","user-data/omadvd"]}' | socat - /path/to.sock
 
 Cheap, and it makes the player scriptable as a side effect.
 
+## 7c. Cover art, from a disc that knows nothing about itself
+
+A DVD carries a volume label, a serial number, and the runtime of each title.
+No title, no year, no cover. So this is a **search**, not a lookup, and it has
+to survive the labels discs actually carry: `CONQUEST_OF_PLANET_OF_THE_APES` is
+not the film's name — the real one has another "the" in it.
+
+Wikipedia's search absorbs exactly that, returning the right article for the
+mangled label. The article gives a plain-text synopsis and a Wikidata id;
+Wikidata gives year, runtime, director and the IMDb id — and, usefully, the
+TMDB id, if a keyed source is ever wanted.
+
+**⚠️ `prop=pageimages` returns nothing for a film.** It only serves
+freely-licensed images, and a poster is non-free. `prop=images` lists every
+image on the page *including* the poster — alongside Wikipedia's own furniture:
+
+```
+File:Conquest of the planet of the apes.jpg   <- the poster
+File:OOjs UI icon edit-ltr-progressive.svg
+File:Symbol category class.svg
+File:Wikiquote-logo.svg
+```
+
+So the filename is scored against the article title by shared words rather than
+taking the first hit, and obvious chrome is filtered by name. No API key is
+needed anywhere in this chain.
+
+**The serial number is identity, not a lookup key.** libdvdnav reports it and
+`lsblk -dno UUID` exposes it without root. There is no public database mapping
+DVD serials to titles — the ones that existed were commercial and are gone, and
+MusicBrainz's DiscID is computed from an *audio CD's* TOC, so it does not apply.
+What the serial is perfect for is caching: metadata, artwork and resume all key
+on it, which is what makes "correct a bad label by hand, once" permanent.
+
+**⚠️ ASS cannot draw an image.** The entire rest of the interface is ASS, but a
+cover is a bitmap, so it goes through mpv's separate `overlay-add` with a raw
+BGRA buffer. Two consequences: it is positioned in window pixels (fine — the
+ASS overlay resolution is set to the window size, so they coincide), and it is
+*not* part of the layer rebuilt each frame, so it must be explicitly removed
+when leaving the screen or it sits on top of the film.
+
+The conversion to BGRA is done by **mpv itself** — it is already in the bundle,
+so the AppImage needs no extra binary:
+
+```
+mpv cover.jpg --vf=scale=W:H:force_original_aspect_ratio=decrease,\
+    pad=W:H:(ow-iw)/2:(oh-ih)/2,format=bgra --of=rawvideo --ovc=rawvideo --frames=1
+```
+
+`force_original_aspect_ratio` plus `pad` is what keeps a poster's shape while
+still producing the single fixed buffer size `overlay-add` requires.
+
+**⚠️ `tonumber(s:gsub(...))` throws.** gsub returns *two* values, and
+tonumber's second argument is a numeric base, so the replacement count arrives
+as the base: "base out of range". Wrap it in another pair of parentheses. The
+same shape caused a separate bug in this project when a rename produced
+`local disc_id = disc_id` — Lua's multiple returns and its scoping rules both
+fail quietly, and `luac -p` catches neither.
+
+Worth knowing: `luac -p -l` does catch the scoping one. Any local referenced
+before it is declared compiles to a `_ENV` global lookup, so dumping the
+bytecode and listing `_ENV` accesses shows every accidental global:
+
+```sh
+luac -p -l src/lua/omadvd.lua | grep -oE '_ENV "[a-z_]+"' | sort -u
+```
+
+If anything but the standard library appears there, it is a typo or an ordering
+mistake that would otherwise be nil at runtime.
+
 ## 8. Burn-in
 
 A paused DVD is a bright still image held indefinitely — the worst thing you

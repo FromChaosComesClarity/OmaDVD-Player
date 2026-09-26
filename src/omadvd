@@ -54,6 +54,7 @@ slang="${OMADVD_SLANG:-}"
 wait_secs=0
 do_unmount=0
 auto_title=yes
+online="${OMADVD_ONLINE:-yes}"
 source_arg=""
 extra=()
 
@@ -74,10 +75,13 @@ Options:
                       raw device and works fine while mounted -- but available
                       if your automounter is fighting you.
       --no-auto-title Do not jump to the longest title; open on title 1.
+      --offline       Never look the disc up online. Only the volume label ever
+                      leaves the machine, and only to Wikipedia, but this turns
+                      it off entirely. Cached results still show.
   -h, --help          This text.
 
 Environment: OMADVD_DEVICE, OMADVD_ALANG, OMADVD_SLANG, OMADVD_MPV,
-             OMADVD_ROOT, OMADVD_QUIET
+             OMADVD_ROOT, OMADVD_QUIET, OMADVD_ONLINE
 USAGE
 }
 
@@ -89,6 +93,7 @@ while [ $# -gt 0 ]; do
     -w|--wait)    wait_secs=${2:?}; shift 2 ;;
     -u|--unmount) do_unmount=1; shift ;;
     --no-auto-title) auto_title=no; shift ;;
+    --offline)    online=no; shift ;;
     -h|--help)    usage; exit 0 ;;
     --)           shift; extra=("$@"); break ;;
     -*)           die "unknown option: $1 (try --help)" ;;
@@ -216,6 +221,7 @@ fi
 # ── Go ───────────────────────────────────────────────────────────────────────
 opts="omadvd-disc_id=${disc_id},omadvd-disc_label=${pretty}"
 opts="${opts},omadvd-auto_main_title=${auto_title}"
+opts="${opts},omadvd-online=${online}"
 [ -n "$alang" ] && opts="${opts},omadvd-prefer_alang=${alang}"
 [ -n "$slang" ] && opts="${opts},omadvd-prefer_slang=${slang}"
 

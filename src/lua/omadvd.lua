@@ -46,6 +46,9 @@ local o = {
   prefer_alang    = "",
   prefer_slang    = "",
   auto_main_title = true,
+  -- Look the disc up online. Only the volume label leaves the machine, and
+  -- only to Wikipedia; everything is cached per disc afterwards.
+  online          = true,
   state_dir       = "",
 }
 options.read_options(o, "omadvd")
@@ -99,6 +102,12 @@ end
 -- ASS colours are written &HBBGGRR& -- blue first. c() takes ordinary RRGGBB
 -- so the constants below can be read by a human.
 -- ---------------------------------------------------------------------------
+-- ⚠️ Declared up here, not next to its definition: the metadata callbacks
+-- below repaint when an answer arrives, and a local declared later would be
+-- compiled as a global lookup in them -- nil at runtime, with nothing from
+-- luac to warn you.
+local render
+
 local function c(rgb)
   return "&H" .. rgb:sub(5, 6) .. rgb:sub(3, 4) .. rgb:sub(1, 2) .. "&"
 end
@@ -178,15 +187,35 @@ local function text(a, x, y, align, size, col, s, extra)
     align, round(x), round(y), size, col, extra or "", esc(s))
 end
 
--- Bold sans averages a shade over half the point size per glyph. Good enough
--- to keep a long disc title from running under the clock; libass gives us no
--- measurement to do better.
+-- Bold sans measures about 0.42 of the point size per glyph on this font --
+-- checked against a real render rather than guessed. 0.50 keeps headroom for a
+-- wide string without truncating titles that would have fitted; libass gives us
+-- no way to measure properly.
 local function fit(s, size, width)
-  local maxn = math.floor(width / (size * 0.55))
+  local maxn = math.floor(width / (size * 0.50))
   if maxn < 1 then maxn = 1 end
   s = tostring(s)
   if #s <= maxn then return s end
   return s:sub(1, math.max(1, maxn - 1)) .. "..."
+end
+
+local function wrap(str, size, width, max_lines)
+  local per = math.max(8, math.floor(width / (size * 0.52)))
+  local out, line = {}, ""
+  for word in tostring(str or ""):gmatch("%S+") do
+    if line == "" then line = word
+    elseif #line + 1 + #word <= per then line = line .. " " .. word
+    else
+      out[#out + 1] = line
+      line = word
+      if max_lines and #out >= max_lines then break end
+    end
+  end
+  if line ~= "" and (not max_lines or #out < max_lines) then out[#out + 1] = line end
+  if max_lines and #out == max_lines then
+    out[#out] = out[#out]:sub(1, math.max(1, per - 1)) .. "..."
+  end
+  return out
 end
 
 local overlay = mp.create_osd_overlay("ass-events")
@@ -364,6 +393,289 @@ local function save_resume()
 end
 
 -- ---------------------------------------------------------------------------
+-- Disc metadata
+--
+-- A DVD carries almost nothing: a volume label, a serial number, and the
+-- runtime of each title. There is no title, no year, no cover. So this is a
+-- *search*, not a lookup, and it has to survive labels like
+-- CONQUEST_OF_PLANET_OF_THE_APES -- which is not the film's name (the real one
+-- has another "the" in it).
+--
+-- Wikipedia's search absorbs that: it returns the right article for the
+-- mangled label. From the article we get a plain-text synopsis and a Wikidata
+-- id; from Wikidata, year, runtime, director and the IMDb id.
+--
+-- ⚠️ The cover needs one non-obvious step. `prop=pageimages` returns nothing
+-- for a film, because a poster is a non-free file and pageimages only serves
+-- freely-licensed ones. `prop=images` lists every image on the page including
+-- that poster -- alongside Wikipedia's own furniture (edit pencils, category
+-- symbols, Wikiquote logos), which is why the filename is scored against the
+-- article title rather than simply taking the first.
+--
+-- Everything here is optional and entirely asynchronous. No network, no curl,
+-- a disc nobody wrote an article about: the player behaves exactly as it did
+-- before, and nothing waits on any of it.
+-- ---------------------------------------------------------------------------
+local UA = "OmaDVD-Player/1.1 (+https://github.com/FromChaosComesClarity/OmaDVD-Player)"
+local WP = "https://en.wikipedia.org/w/api.php"
+
+local meta = {}          -- title, year, runtime, director, genres, overview, poster
+local meta_state = "off" -- off | looking | done
+local have_curl = nil
+
+local function meta_dir() return state_dir() .. "/meta" end
+
+local function meta_file(ext)
+  local id = disc_id
+  if id == nil or id == "" then id = "unknown" end
+  id = id:gsub("[^%w%-_%.]", "_")
+  return meta_dir() .. "/" .. id .. "." .. ext
+end
+
+local function urlenc(str)
+  return (tostring(str):gsub("[^%w%-%.%_%~]", function(ch)
+    return string.format("%%%02X", string.byte(ch))
+  end))
+end
+
+local function fetch_json(url, cb)
+  shell_async({ "curl", "-sL", "--max-time", "12", "-A", UA, url }, function(ok, out)
+    if not ok or not out or out == "" then cb(nil) return end
+    local parsed = utils.parse_json(out)
+    cb(parsed)
+  end)
+end
+
+local function first_page(j)
+  if not j or not j.query or not j.query.pages then return nil end
+  for _, page in pairs(j.query.pages) do return page end
+  return nil
+end
+
+-- Wikipedia's own furniture, which appears on nearly every article and is never
+-- what we want.
+local function is_chrome(name)
+  local n = name:lower()
+  if n:sub(-4) == ".svg" then return true end
+  for _, bad in ipairs({ "logo", "icon", "symbol", "userbox", "ambox", "commons",
+                         "question_book", "edit-", "wiki", "folder", "padlock",
+                         "disambig", "portal", "generic" }) do
+    if n:find(bad, 1, true) then return true end
+  end
+  return false
+end
+
+-- Score a filename against the article title by shared words. The poster for
+-- "Conquest of the Planet of the Apes" is filed as
+-- "Conquest of the planet of the apes.jpg" -- different case, same words.
+local function name_score(file, title)
+  local f = file:lower():gsub("^file:", ""):gsub("%.%w+$", "")
+  local hits, total = 0, 0
+  for word in title:lower():gmatch("%a+") do
+    if #word > 2 then
+      total = total + 1
+      if f:find(word, 1, true) then hits = hits + 1 end
+    end
+  end
+  if total == 0 then return 0 end
+  return hits / total
+end
+
+-- Turn whatever we downloaded into the exact BGRA buffer overlay-add wants.
+-- mpv is already here and can do it, so the AppImage needs no extra binary.
+local POSTER_W, POSTER_H = 176, 250
+
+local function make_poster_bitmap(jpg, cb)
+  -- The AppImage's AppRun exports OMADVD_MPV; from source it is just mpv.
+  local mpv = os.getenv("OMADVD_MPV") or "mpv"
+  shell_async({ mpv, "--no-config", jpg, "--no-audio", "--really-quiet",
+                -- ⚠️ overlay-add needs a buffer of exactly one size, but a
+                -- poster is not that shape. force_original_aspect_ratio=decrease
+                -- plus pad fits it inside the box without stretching it, and
+                -- keeps the byte count fixed.
+                "--vf=scale=" .. POSTER_W .. ":" .. POSTER_H ..
+                ":force_original_aspect_ratio=decrease," ..
+                "pad=" .. POSTER_W .. ":" .. POSTER_H .. ":(ow-iw)/2:(oh-ih)/2," ..
+                "format=bgra",
+                "--of=rawvideo", "--ovc=rawvideo", "--frames=1",
+                "--o=" .. meta_file("bgra") }, function(ok)
+    cb(ok)
+  end)
+end
+
+local function meta_save()
+  mp.command_native({ name = "subprocess", playback_only = false,
+                      args = { "mkdir", "-p", meta_dir() } })
+  local f = io.open(meta_file("json"), "w")
+  if f then f:write(utils.format_json(meta)) f:close() end
+end
+
+local function meta_load_cached()
+  local f = io.open(meta_file("json"), "r")
+  if not f then return false end
+  local body = f:read("*a"); f:close()
+  local t = utils.parse_json(body or "")
+  if not t or not t.title then return false end
+  meta = t
+  meta_state = "done"
+  return true
+end
+
+local function poster_ready()
+  local f = io.open(meta_file("bgra"), "rb")
+  if not f then return false end
+  local n = f:seek("end"); f:close()
+  return n == POSTER_W * POSTER_H * 4
+end
+
+-- ⚠️ ASS cannot draw an image, so the cover is a second, separate overlay --
+-- mpv's overlay-add, fed the raw BGRA buffer we converted earlier. It is
+-- positioned in window pixels, which match our ASS units because the overlay
+-- resolution is set to the window size.
+local POSTER_ID = 7
+local poster_shown = false
+
+local function poster_hide()
+  if not poster_shown then return end
+  mp.commandv("overlay-remove", POSTER_ID)
+  poster_shown = false
+end
+
+local function poster_show(x, y)
+  if not poster_ready() then return false end
+  mp.commandv("overlay-add", POSTER_ID, math.floor(x), math.floor(y),
+              meta_file("bgra"), 0, "bgra", POSTER_W, POSTER_H, POSTER_W * 4)
+  poster_shown = true
+  return true
+end
+
+-- ── the chain ───────────────────────────────────────────────────────────────
+local function step_poster(images, title)
+  local best, best_score = nil, 0.45   -- below this it is probably not the film
+  local first_raster = nil
+  for _, im in ipairs(images or {}) do
+    local name = im.title or ""
+    if not is_chrome(name) then
+      if not first_raster then first_raster = name end
+      local sc = name_score(name, title)
+      if sc > best_score then best, best_score = name, sc end
+    end
+  end
+  -- Scoring by shared words only works when the file is named after the
+  -- article, which is usual for films and not at all usual elsewhere: the cover
+  -- of "Live at Budokan (Dream Theater album)" is filed under neither. Fall
+  -- back to the first non-chrome image on the page, which is the infobox
+  -- image -- the cover -- because prop=images returns them in page order.
+  if not best then best = first_raster end
+  if not best then meta_state = "done"; meta_save(); return end
+
+  fetch_json(WP .. "?action=query&titles=" .. urlenc(best) ..
+             "&prop=imageinfo&iiprop=url|mime&iiurlwidth=400&format=json", function(j)
+    local page = first_page(j)
+    local info = page and page.imageinfo and page.imageinfo[1]
+    local url  = info and (info.thumburl or info.url)
+    if not url then meta_state = "done"; meta_save(); return end
+    mp.command_native({ name = "subprocess", playback_only = false,
+                        args = { "mkdir", "-p", meta_dir() } })
+    shell_async({ "curl", "-sL", "--max-time", "20", "-A", UA,
+                  "-o", meta_file("jpg"), url }, function(ok)
+      if not ok then meta_state = "done"; meta_save(); return end
+      make_poster_bitmap(meta_file("jpg"), function(converted)
+        meta.poster = converted and true or nil
+        meta_state = "done"
+        meta_save()
+        render()
+      end)
+    end)
+  end)
+end
+
+local function step_wikidata(qid, images, title)
+  if not qid then step_poster(images, title) return end
+  fetch_json("https://www.wikidata.org/wiki/Special:EntityData/" .. qid .. ".json",
+  function(j)
+    local ent = j and j.entities and j.entities[qid]
+    local claims = ent and ent.claims
+    if claims then
+      local function first(prop, key)
+        local c = claims[prop]
+        local v = c and c[1] and c[1].mainsnak and c[1].mainsnak.datavalue
+        v = v and v.value
+        if type(v) == "table" then return v[key] end
+        return v
+      end
+      local when = first("P577", "time")
+      if when then meta.year = tostring(when):match("(%d%d%d%d)") end
+      local mins = first("P2047", "amount")
+      -- ⚠️ The extra parentheses are load-bearing. gsub returns TWO values, and
+      -- tonumber's second argument is a numeric base -- so tonumber(s:gsub(...))
+      -- passes the replacement count as the base and throws "base out of range".
+      if mins then meta.runtime = tonumber((tostring(mins):gsub("%+", ""))) end
+      meta.imdb = first("P345")
+    end
+    step_poster(images, title)
+  end)
+end
+
+local function meta_lookup(label)
+  if meta_state == "looking" then return end
+  meta_state = "looking"
+  meta = {}
+
+  fetch_json(WP .. "?action=query&list=search&srsearch=" .. urlenc(label) ..
+             "&srlimit=1&format=json", function(j)
+    local hit = j and j.query and j.query.search and j.query.search[1]
+    local title = hit and hit.title
+    if not title then meta_state = "done" return end
+    meta.title = title
+
+    fetch_json(WP .. "?action=query&titles=" .. urlenc(title) ..
+               "&prop=extracts|pageprops|images&exintro=1&explaintext=1" ..
+               "&imlimit=40&format=json", function(j2)
+      local page = first_page(j2)
+      if page then
+        local ex = page.extract
+        if ex and ex ~= "" then meta.overview = ex end
+        local qid = page.pageprops and page.pageprops.wikibase_item
+        render()
+        step_wikidata(qid, page.images, title)
+      else
+        meta_state = "done"
+      end
+    end)
+  end)
+end
+
+-- Kick off a lookup for whatever is in the drive, unless we already know this
+-- disc or the viewer has turned the network off.
+local function meta_begin()
+  meta = {}
+  meta_state = "off"
+  if meta_load_cached() then render() return end
+  if o.online ~= true then return end
+  if have_curl == nil then
+    have_curl = (mp.command_native({ name = "subprocess", playback_only = false,
+                                     args = { "sh", "-c", "command -v curl" },
+                                     capture_stdout = true }) or {}).status == 0
+  end
+  if not have_curl then
+    msg.warn("no curl: skipping the metadata lookup")
+    return
+  end
+  -- A name file lets a useless label be corrected by hand: a concert disc
+  -- labelled DREAMTHEATER is never going to find itself.
+  local nf = io.open(meta_file("name"), "r")
+  local label = disc_label
+  if nf then
+    local forced = (nf:read("*l") or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    nf:close()
+    if forced ~= "" then label = forced end
+  end
+  if label == nil or label == "" or label == "DVD" then return end
+  meta_lookup(label)
+end
+
+-- ---------------------------------------------------------------------------
 -- Disc model
 -- ---------------------------------------------------------------------------
 local disc = { titles = {}, main = nil }
@@ -440,7 +752,6 @@ local ui = {
   drift = 0,
 }
 
-local render                       -- forward declaration
 local show_nodisc, load_disc       -- defined once the menus exist
 local osd_timer, tick_timer, disc_timer
 local ui_started   = false
@@ -547,11 +858,16 @@ menus.main = function()
   rows[#rows + 1] = { label = "Audio",     detail = track_detail("audio", "aid"), sub = "audio" }
   rows[#rows + 1] = { label = "Subtitles", detail = track_detail("sub", "sid"),   sub = "subs" }
   rows[#rows + 1] = { label = "Picture",   detail = aspect_detail(),              sub = "picture" }
+  rows[#rows + 1] = { label = "About this disc",
+                      detail = (meta_state == "looking" and "...") or (meta.year or ""),
+                      sub = "info" }
   rows[#rows + 1] = { label = "Eject disc", detail = "", act = eject }
   rows[#rows + 1] = { label = "Quit",       detail = "", act = function()
     save_resume(); mp.command("quit")
   end }
-  return rows, (disc_label ~= "" and disc_label or "DVD")
+  -- Prefer the name the lookup found: "Conquest of the Planet of the Apes"
+  -- reads rather better across a room than CONQUEST OF PLANET OF THE APES.
+  return rows, meta.title or (disc_label ~= "" and disc_label or "DVD")
 end
 
 menus.titles = function()
@@ -623,6 +939,10 @@ menus.subs = function()
   return rows, "Subtitles"
 end
 
+menus.info = function()
+  return {}, meta.title or disc_label
+end
+
 menus.picture = function()
   return {
     { label = "Aspect", detail = aspect_detail(), keep = true, act = function()
@@ -667,7 +987,7 @@ local function rebuild()
   ui.rows, ui.title = rows, title or id
   local sel = ui.sel[id] or 1
   if sel > #rows then sel = #rows end
-  if sel < 1 then sel = 1 end
+  if sel < 1 then sel = 1 end   -- the info screen has none; 1 is harmless
   ui.sel[id] = sel
 end
 
@@ -713,6 +1033,7 @@ load_disc = function()
     disc.main    = nil
     ui.mode = "loading"
     render()
+    meta_begin()          -- a new disc is a new identity, cache included
     mp.commandv("loadfile", "dvdnav://")
   end)
 end
@@ -742,6 +1063,68 @@ local function draw_loading(a)
   local y = round((M.h - h) / 2)
   rect(a, M.x0, y, M.cw, h, COL.panel, 0x10)
   text(a, M.w / 2, y + round((h - M.fs_head) / 2), 8, M.fs_head, COL.accent, "Loading...")
+end
+
+-- Cover on the left, facts on the right, synopsis under them. The cover is not
+-- drawn here -- it is a real bitmap on its own overlay (poster_show) -- so this
+-- only reserves the space for it.
+local function draw_info(a)
+  rect(a, 0, 0, M.w, M.h, COL.black, 0x30)
+  rect(a, M.x0, M.y0, M.cw, M.ch, COL.panel, 0x10)
+
+  local px, py = M.x0 + M.pad, M.y0 + M.head_h
+  local has_poster = poster_ready()
+  local tx = has_poster and (px + POSTER_W + M.pad) or px
+  local tw = M.x1 - M.pad - tx
+
+  -- A film title is the one string here worth shrinking to keep whole.
+  local heading = meta.title or disc_label
+  local hsize   = M.fs_head
+  local hroom   = M.cw - M.pad * 2
+  if #heading * hsize * 0.50 > hroom then hsize = M.fs_row end
+  text(a, M.x0 + M.pad, M.y0 + round(M.pad * 0.6), 7, hsize, COL.ink,
+       fit(heading, hsize, hroom))
+
+  if has_poster then
+    -- A flat plate behind the cover: the bitmap overlay has no border of its
+    -- own, and a 4px-plus frame is what keeps its edge from shimmering.
+    rect(a, px - M.stroke, py - M.stroke,
+         POSTER_W + M.stroke * 2, POSTER_H + M.stroke * 2, COL.row, 0x00)
+  end
+
+  local y = py
+  if meta_state == "looking" and not meta.title then
+    text(a, tx, y, 7, M.fs_row, COL.dim, "Looking it up...")
+    return
+  end
+  if not meta.title then
+    for _, ln in ipairs(wrap("Nothing found for this disc. Drop a line with the "
+        .. "real name into " .. meta_file("name") .. " and it will be looked up "
+        .. "again.", M.fs_small, tw, 6)) do
+      text(a, tx, y, 7, M.fs_small, COL.dim, ln); y = y + round(M.fs_small * 1.3)
+    end
+    return
+  end
+
+  local facts = {}
+  if meta.year    then facts[#facts + 1] = meta.year end
+  if meta.runtime then facts[#facts + 1] = math.floor(meta.runtime) .. " min" end
+  if meta.imdb    then facts[#facts + 1] = meta.imdb end
+  if #facts > 0 then
+    text(a, tx, y, 7, M.fs_row, COL.accent, table.concat(facts, "   "))
+    y = y + round(M.fs_row * 1.4)
+  end
+
+  local bottom = M.y1 - M.foot_h - M.pad
+  if meta.overview then
+    local room = math.max(1, math.floor((bottom - y) / (M.fs_small * 1.3)))
+    for _, ln in ipairs(wrap(meta.overview, M.fs_small, tw, room)) do
+      text(a, tx, y, 7, M.fs_small, COL.ink, ln)
+      y = y + round(M.fs_small * 1.3)
+    end
+  end
+
+  text(a, M.x0 + M.pad, M.y1 - M.foot_h, 7, M.fs_small, COL.dim, "Esc back")
 end
 
 local function draw_osd(a)
@@ -837,13 +1220,23 @@ render = function()
     disc  = disc_label,
     rows  = #ui.rows,
   })
+  -- The cover belongs to the info screen alone. Anywhere else it would sit on
+  -- top of the film, because a bitmap overlay is not part of the ASS layer we
+  -- rebuild each frame.
+  local on_info = (ui.mode == "menu" and ui.stack[#ui.stack] == "info")
+  if on_info then
+    if not poster_shown then poster_show(M.x0 + M.pad, M.y0 + M.head_h) end
+  else
+    poster_hide()
+  end
+
   local a = {}
   if ui.mode == "blank" then
     draw_blank(a)
   elseif ui.mode == "loading" then
     draw_loading(a)
   elseif ui.mode == "menu" then
-    draw_menu(a)
+    if ui.stack[#ui.stack] == "info" then draw_info(a) else draw_menu(a) end
   elseif ui.mode == "osd" then
     draw_osd(a)
   else
@@ -1083,6 +1476,7 @@ mp.register_event("file-loaded", function()
     -- loaded instead, and its Play row targets the main feature, so the reload
     -- happens when the viewer asked for it and has a "Loading..." panel to
     -- look at.
+    meta_begin()
     show_menu()
   end
 end)

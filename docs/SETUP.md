@@ -103,6 +103,24 @@ publish its label. If it stays that way, check `lsblk -dn -P -o LABEL,UUID
 /dev/sr0` reports something — an empty UUID *and* an empty label is how OmaDVD
 decides the tray is empty.
 
+**The cover or the title is wrong, or missing**
+The lookup is a *search* on the volume label, and some labels are hopeless. Fix
+it once, permanently, by name:
+
+```sh
+lsblk -dno UUID /dev/sr0                       # the disc's serial
+echo "The Real Title" > ~/.local/state/omadvd/meta/<serial>.name
+rm ~/.local/state/omadvd/meta/<serial>.json    # drop the cached answer
+```
+
+Or supply the artwork yourself as `~/.local/state/omadvd/meta/<serial>.jpg` and
+delete the `.bgra` beside it so it gets re-converted.
+
+**No metadata at all**
+Needs `curl` and a working connection; without either it silently does nothing.
+`--offline` disables it on purpose. Nothing but the volume label is ever sent,
+and only to Wikipedia.
+
 **Playback is fine but nothing is on screen for several seconds after choosing
 a title**
 Expected: changing title reloads the encrypted stream and re-fetches CSS keys.
