@@ -150,6 +150,25 @@ Resume is per-disc, keyed on the disc's own serial number, so a half-watched
 film picks up where it stopped even after other discs in between — including
 discs swapped without leaving the player.
 
+## Gamepad
+
+mpv has first-class SDL gamepad input, so this needs **no daemon** and works even
+with OmaCRT's own input daemon disabled. Plug a pad in and it is recognised.
+
+| Button | In a menu | While playing |
+|---|---|---|
+| D-pad / left stick ↑ ↓ | move | previous / next chapter |
+| D-pad / left stick ← → | back / select | seek ∓10s |
+| A | select | menu |
+| B | back | menu |
+| X | select | play / pause |
+| Start, Menu | close | menu |
+| L1 / R1 | — | previous / next chapter |
+| L2 / R2 | — | seek ∓60s |
+
+Every binding names its keyboard and gamepad keys in the same call, so the two
+cannot drift apart.
+
 ## Build
 
 ```sh
