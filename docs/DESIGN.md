@@ -204,12 +204,54 @@ So the filename is scored against the article title by shared words rather than
 taking the first hit, and obvious chrome is filtered by name. No API key is
 needed anywhere in this chain.
 
+### Identifying a disc that only names a band
+
+`RHCP_OFF_THE_MAP` and `DREAMTHEATER` are both concert discs, and neither
+resolves by searching its label: the first hit for one is *List of Red Hot
+Chili Peppers band members* and for the other it is the band itself.
+
+Three things fix the first case completely and the second case as far as it can
+be fixed:
+
+1. **Skip list, discography and disambiguation articles.** They are never the
+   disc, and worse they are dead ends — only a real entity has releases hanging
+   off it, so picking one loses step 2 as well.
+2. **Ask Wikidata for the artist's releases.** `?item wdt:P175 wd:<qid>` returns
+   every work by that performer; filtering to video albums and films (and *not*
+   concert tours, of which a band has many more) leaves a handful. ⚠️ P175 is
+   "performer", so this returns nothing at all for a film — which makes it
+   self-limiting, with no need to first work out what kind of thing was found.
+3. **Match those release names back against the disc label.** "Off the Map"
+   has every significant word present in `RHCP_OFF_THE_MAP`, so it wins
+   outright and nobody is asked anything. "Metropolis 2000: Scenes from New
+   York" shares nothing with `DREAMTHEATER`, so it does not — and that is the
+   honest answer, because the disc really does not say.
+
+**⚠️ Having picked a release, do not search for it by name.** "Off the Map"
+searches straight to a disambiguation page. The SPARQL result already carries
+the release's Wikidata id, so go to the entity and follow its `sitelinks.enwiki`
+to the exact article. Same reason the picker stores its answer and not a guess.
+
+When no release matches, the candidates become a **menu**. Five rows a viewer
+can choose from with a d-pad is a real answer; a text file to edit is not. The
+choice is written against the disc's serial number, so it is asked once per
+disc, ever.
+
 **The serial number is identity, not a lookup key.** libdvdnav reports it and
 `lsblk -dno UUID` exposes it without root. There is no public database mapping
 DVD serials to titles — the ones that existed were commercial and are gone, and
 MusicBrainz's DiscID is computed from an *audio CD's* TOC, so it does not apply.
-What the serial is perfect for is caching: metadata, artwork and resume all key
-on it, which is what makes "correct a bad label by hand, once" permanent.
+What the serial is perfect for is caching: metadata, artwork, the picker's
+answer and resume all key on it, which is what makes identifying a disc a
+once-ever event.
+
+Checked, so it does not need checking again: there is **no live public database
+keyed on a DVD fingerprint**. Microsoft's DVD ID fed the Windows Media Center
+metadata service, which is retired; GD3 is commercial and its DVD service is no
+longer updated; TheDiscDB is alive and community-run but Blu-ray-centric, aimed
+at mapping titles for ripping rather than artwork, and has no documented public
+API. TMDB and OMDb have real APIs but are keyed on *title*, so they can enrich
+what we found — they cannot tell us which disc is in the tray.
 
 **⚠️ ASS cannot draw an image.** The entire rest of the interface is ASS, but a
 cover is a bitmap, so it goes through mpv's separate `overlay-add` with a raw

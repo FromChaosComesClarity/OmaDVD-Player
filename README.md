@@ -43,31 +43,38 @@ or from a gamepad through OmaCRT's input daemon, with no modifier keys.
 
 ## Cover art and metadata
 
-If the machine is online, OmaDVD looks the disc up and shows a cover, year,
-runtime, IMDb id and synopsis on an **About this disc** screen — and uses the
-real title in the menu heading, so the menu says *Conquest of the Planet of the
-Apes* rather than `CONQUEST OF PLANET OF THE APES`.
+If the machine is online, OmaDVD identifies the disc and shows a cover, year,
+runtime and synopsis on an **About this disc** screen — and puts the real title
+in the menu heading, so it reads *Conquest of the Planet of the Apes* rather
+than `CONQUEST OF PLANET OF THE APES`.
 
-No API key, no account. It searches Wikipedia with the volume label, which is
-forgiving enough to cope with the labels discs actually carry — that one is
-missing a "the" and still resolves. Wikidata supplies year, runtime and the
-IMDb id; the poster comes off the article.
+No API key and no account. A DVD carries almost nothing to go on — a volume
+label, a serial number, and the runtime of each title — so this is a *search*,
+not a lookup, and it is built to survive the labels discs actually have:
 
-Everything is cached per disc under `~/.local/state/omadvd/meta/`, keyed on the
-**disc's own serial number**, so it is fetched once and works offline forever
-after. The lookup is fully asynchronous — nothing in the player ever waits on
-the network, and with no connection it simply carries on.
+| Disc label | Identified as |
+|---|---|
+| `CONQUEST_OF_PLANET_OF_THE_APES` | Conquest of the Planet of the Apes (1972) — *label is missing a "the"* |
+| `RHCP_OFF_THE_MAP` | Off the Map (video) (2001) — *via the band, then matched back to the label* |
+| `DREAMTHEATER` | asks: five Dream Theater releases, pick one |
 
-A disc whose label is hopeless (`DREAMTHEATER`) can be named by hand, once:
+The chain: Wikipedia's search on the label (skipping list, discography and
+disambiguation pages, which are dead ends), then Wikidata for year, runtime and
+the IMDb id, then the poster off the article. When the label only names an
+**artist**, Wikidata is asked for that artist's video releases and their names
+are matched back against the label — which is how `RHCP_OFF_THE_MAP` resolves
+without anyone being asked anything.
 
-```sh
-echo "Dream Theater Live at Budokan" > ~/.local/state/omadvd/meta/<serial>.name
-```
+When it genuinely cannot tell — `DREAMTHEATER` names a band and nothing else —
+it says so, and **Enter on the About screen lists the candidates** so you can
+pick yours with the d-pad. That choice is remembered against the **disc's own
+serial number**, so it is asked once per disc, ever.
 
-The serial is in the same folder's filenames, and `lsblk -dno UUID /dev/sr0`
-prints it. Drop your own `<serial>.jpg` there instead if you would rather
-supply the cover yourself. `--offline` disables lookups entirely; cached
-results still show.
+Everything is cached under `~/.local/state/omadvd/meta/`, keyed on that serial,
+so it is fetched once and works offline afterwards. The whole chain is
+asynchronous — nothing in the player ever waits on the network, and with no
+connection it simply carries on. `--offline` disables it; cached results still
+show. Drop your own `<serial>.jpg` in that folder to supply artwork yourself.
 
 Only the volume label ever leaves the machine, and only to Wikipedia.
 

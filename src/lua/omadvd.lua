@@ -420,6 +420,7 @@ local UA = "OmaDVD-Player/1.1 (+https://github.com/FromChaosComesClarity/OmaDVD-
 local WP = "https://en.wikipedia.org/w/api.php"
 
 local meta = {}          -- title, year, runtime, director, genres, overview, poster
+local candidates = {}    -- other things this disc might be, for the picker
 local meta_state = "off" -- off | looking | done
 local have_curl = nil
 
@@ -468,6 +469,24 @@ end
 -- Score a filename against the article title by shared words. The poster for
 -- "Conquest of the Planet of the Apes" is filed as
 -- "Conquest of the planet of the apes.jpg" -- different case, same words.
+-- The other direction from name_score: how much of a release's title is
+-- present in the disc label. RHCP_OFF_THE_MAP contains every significant word
+-- of "Off the Map", which is enough to pick it without asking anyone.
+local STOP = { the = true, and_ = true, a = true, of = true, at = true,
+               in_ = true, on = true, to = true, for_ = true }
+local function label_score(work, label)
+  local lab = label:lower()
+  local hits, total = 0, 0
+  for word in work:lower():gmatch("[%w]+") do
+    if #word >= 3 and not STOP[word] then
+      total = total + 1
+      if lab:find(word, 1, true) then hits = hits + 1 end
+    end
+  end
+  if total < 2 then return 0 end     -- one word is a coincidence, not a match
+  return hits / total
+end
+
 local function name_score(file, title)
   local f = file:lower():gsub("^file:", ""):gsub("%.%w+$", "")
   local hits, total = 0, 0
@@ -504,6 +523,7 @@ local function make_poster_bitmap(jpg, cb)
 end
 
 local function meta_save()
+  meta.candidates = candidates
   mp.command_native({ name = "subprocess", playback_only = false,
                       args = { "mkdir", "-p", meta_dir() } })
   local f = io.open(meta_file("json"), "w")
@@ -517,6 +537,7 @@ local function meta_load_cached()
   local t = utils.parse_json(body or "")
   if not t or not t.title then return false end
   meta = t
+  candidates = t.candidates or {}
   meta_state = "done"
   return true
 end
@@ -550,6 +571,8 @@ local function poster_show(x, y)
 end
 
 -- ── the chain ───────────────────────────────────────────────────────────────
+local meta_lookup   -- assigned below; meta_choose calls it
+
 local function step_poster(images, title)
   local best, best_score = nil, 0.45   -- below this it is probably not the film
   local first_raster = nil
@@ -590,6 +613,92 @@ local function step_poster(images, title)
   end)
 end
 
+-- A disc labelled DREAMTHEATER resolves to the *band*, and no amount of search
+-- tuning turns that into "Metropolis 2000: Scenes from New York" -- the disc
+-- simply does not say. But Wikidata knows every video album that band released,
+-- and there are five. Five rows on a screen is an answer; a text file is not.
+--
+-- P175 is "performer", so this returns nothing at all for a film -- which makes
+-- it self-limiting: no need to work out first whether the hit is a group.
+local lookup_label = ""
+local step_release      -- defined below; step_works hands the winner to it
+
+local function fetch_page(title, cb)
+  fetch_json(WP .. "?action=query&titles=" .. urlenc(title) ..
+             "&prop=extracts|pageprops|images&exintro=1&explaintext=1" ..
+             "&imlimit=40&format=json", function(j) cb(first_page(j)) end)
+end
+
+local function step_works(qid, done)
+  if not qid then done() return end
+  local q = "SELECT ?item ?label ?typeLabel WHERE { ?item wdt:P175 wd:" .. qid ..
+            " . ?item wdt:P31 ?type . ?item rdfs:label ?label ." ..
+            " FILTER(lang(?label)='en') ?type rdfs:label ?typeLabel ." ..
+            " FILTER(lang(?typeLabel)='en') } LIMIT 400"
+  shell_async({ "curl", "-s", "--max-time", "20", "-A", UA,
+                "-H", "Accept: application/sparql-results+json",
+                "-G", "--data-urlencode", "query=" .. q,
+                "https://query.wikidata.org/sparql" }, function(ok, out)
+    if ok and out ~= "" then
+      local j = utils.parse_json(out)
+      local rows = j and j.results and j.results.bindings
+      local works = {}
+      for _, r in ipairs(rows or {}) do
+        local ty = (r.typeLabel and r.typeLabel.value or ""):lower()
+        -- ⚠️ "concert" also matches "concert tour", and a band has far more
+        -- tours than discs -- 30 of them here, burying the five things the
+        -- viewer might actually be holding. A tour is not a disc.
+        local wanted = (ty:find("video album") or ty:find("film")) and not ty:find("tour")
+        if wanted then
+          local nm  = r.label and r.label.value
+          local uri = r.item and r.item.value or ""
+          if nm then
+            local seen = false
+            for _, w in ipairs(works) do if w.name == nm then seen = true break end end
+            if not seen then
+              works[#works + 1] = { name = nm, qid = uri:match("(Q%d+)$") }
+            end
+          end
+        end
+      end
+      -- If one of the releases is named in the disc label, that IS the disc --
+      -- no need to ask. Re-running the lookup on its own title gets its year,
+      -- runtime, synopsis and cover, exactly as if the label had been good.
+      local names = {}
+      for _, w in ipairs(works) do names[#names + 1] = w.name end
+
+      local best, best_score = nil, 0.79
+      for _, w in ipairs(works) do
+        local sc = label_score(w.name, lookup_label)
+        if sc > best_score then best, best_score = w, sc end
+      end
+      if best then
+        -- ⚠️ Do NOT re-search Wikipedia for the winner's name. "Off the Map"
+        -- searches straight to a disambiguation page, and the whole point was
+        -- to stop guessing. We already hold the release's Wikidata id, so go to
+        -- the article it actually points at.
+        candidates = names
+        step_release(best.qid, best.name)
+        return
+      end
+
+      -- Releases first: if the label resolved to a band, the disc is one of
+      -- these, and the search hits behind them are mostly noise.
+      if #works > 0 then
+        local merged = {}
+        for _, w in ipairs(names) do merged[#merged + 1] = w end
+        for _, c in ipairs(candidates) do
+          local seen = false
+          for _, m in ipairs(merged) do if m == c then seen = true break end end
+          if not seen and #merged < 14 then merged[#merged + 1] = c end
+        end
+        candidates = merged
+      end
+    end
+    done()
+  end)
+end
+
 local function step_wikidata(qid, images, title)
   if not qid then step_poster(images, title) return end
   fetch_json("https://www.wikidata.org/wiki/Special:EntityData/" .. qid .. ".json",
@@ -617,16 +726,74 @@ local function step_wikidata(qid, images, title)
   end)
 end
 
-local function meta_lookup(label)
+-- A release we identified ourselves: its Wikidata item gives the year, the
+-- runtime and -- through the sitelink -- the exact article, with no search and
+-- therefore no chance of landing on a disambiguation page. ("Off the Map"
+-- searches straight to one, which is how this function came to exist.)
+step_release = function(wqid, name)
+  meta.title = name
+  if not wqid then meta_state = "done"; meta_save(); render(); return end
+  fetch_json("https://www.wikidata.org/wiki/Special:EntityData/" .. wqid .. ".json",
+  function(j)
+    local ent = j and j.entities and j.entities[wqid]
+    if ent then
+      local claims = ent.claims or {}
+      local function first(prop, key)
+        local c = claims[prop]
+        local v = c and c[1] and c[1].mainsnak and c[1].mainsnak.datavalue
+        v = v and v.value
+        if type(v) == "table" then return v[key] end
+        return v
+      end
+      local when = first("P577", "time")
+      if when then meta.year = tostring(when):match("(%d%d%d%d)") end
+      local mins = first("P2047", "amount")
+      if mins then meta.runtime = tonumber((tostring(mins):gsub("%+", ""))) end
+      meta.imdb = first("P345")
+      local sl = ent.sitelinks and ent.sitelinks.enwiki
+      if sl and sl.title then meta.title = sl.title end
+    end
+    render()
+    fetch_page(meta.title, function(page)
+      if page then
+        local ex = page.extract
+        if ex and ex ~= "" then meta.overview = ex end
+        step_poster(page.images, meta.title)
+      else
+        meta_state = "done"; meta_save(); render()
+      end
+    end)
+  end)
+end
+
+meta_lookup = function(label)
   if meta_state == "looking" then return end
   meta_state = "looking"
+  lookup_label = label
   meta = {}
 
   fetch_json(WP .. "?action=query&list=search&srsearch=" .. urlenc(label) ..
-             "&srlimit=1&format=json", function(j)
-    local hit = j and j.query and j.query.search and j.query.search[1]
-    local title = hit and hit.title
-    if not title then meta_state = "done" return end
+             "&srlimit=8&format=json", function(j)
+    local hits = j and j.query and j.query.search
+    if not hits or not hits[1] then meta_state = "done" return end
+    -- ⚠️ "RHCP OFF THE MAP" puts "List of Red Hot Chili Peppers band members"
+    -- first. A list, a disambiguation page or a discography is never the disc,
+    -- and worse, it is a dead end: only a real entity has releases hanging off
+    -- it, so picking one loses the works query too.
+    local function junk(t)
+      local n = t:lower()
+      return n:find("^list of") or n:find("disambiguation") or n:find("discography")
+    end
+    local title
+    for _, h in ipairs(hits) do
+      if not junk(h.title) then title = h.title break end
+    end
+    title = title or hits[1].title
+    -- Keep the also-rans. The top hit is a guess, and a disc labelled with
+    -- nothing but a band name will guess wrong -- so the viewer needs a way to
+    -- say "no, it is that one" without leaving the sofa.
+    candidates = {}
+    for _, h in ipairs(hits) do candidates[#candidates + 1] = h.title end
     meta.title = title
 
     fetch_json(WP .. "?action=query&titles=" .. urlenc(title) ..
@@ -638,12 +805,34 @@ local function meta_lookup(label)
         if ex and ex ~= "" then meta.overview = ex end
         local qid = page.pageprops and page.pageprops.wikibase_item
         render()
-        step_wikidata(qid, page.images, title)
+        step_works(qid, function() step_wikidata(qid, page.images, title) end)
       else
         meta_state = "done"
       end
     end)
   end)
+end
+
+-- The viewer's answer is written to the same <serial>.name file the manual
+-- override uses, so a choice made once on screen survives every future
+-- insertion of that disc -- keyed on the disc's own serial number, which is the
+-- one thing a DVD does tell us reliably.
+local function meta_choose(name)
+  mp.command_native({ name = "subprocess", playback_only = false,
+                      args = { "mkdir", "-p", meta_dir() } })
+  local f = io.open(meta_file("name"), "w")
+  if f then f:write(name .. "\n") f:close() end
+  os.remove(meta_file("json"))
+  os.remove(meta_file("bgra"))
+  os.remove(meta_file("jpg"))
+  meta = {}
+  -- ⚠️ Do NOT set meta_state = "looking" here. meta_lookup() opens with a
+  -- re-entrancy guard that returns early when it is already "looking", so
+  -- setting it first makes the call a silent no-op -- the choice gets written
+  -- and nothing is ever fetched for it.
+  meta.title = name          -- show the chosen name while the lookup runs
+  render()
+  meta_lookup(name)
 end
 
 -- Kick off a lookup for whatever is in the drive, unless we already know this
@@ -753,6 +942,7 @@ local ui = {
 }
 
 local show_nodisc, load_disc       -- defined once the menus exist
+local back                         -- the picker hands you back to the info screen
 local osd_timer, tick_timer, disc_timer
 local ui_started   = false
 local ejecting     = false
@@ -943,6 +1133,25 @@ menus.info = function()
   return {}, meta.title or disc_label
 end
 
+-- "It guessed wrong" is a normal outcome for a disc whose only clue is a band
+-- name, so correcting it is one row and one press, not a text editor.
+menus.pick = function()
+  local rows = {}
+  for _, name in ipairs(candidates) do
+    local n = name
+    rows[#rows + 1] = {
+      label  = n,
+      detail = (meta.title == n) and "current" or "",
+      mark   = (meta.title == n),
+      act    = function() meta_choose(n); back() end,
+    }
+  end
+  if #rows == 0 then
+    rows[1] = { label = "Nothing else to choose from", off = true }
+  end
+  return rows, "Which disc is this?"
+end
+
 menus.picture = function()
   return {
     { label = "Aspect", detail = aspect_detail(), keep = true, act = function()
@@ -1124,7 +1333,9 @@ local function draw_info(a)
     end
   end
 
-  text(a, M.x0 + M.pad, M.y1 - M.foot_h, 7, M.fs_small, COL.dim, "Esc back")
+  local hint = "Esc back"
+  if #candidates > 0 then hint = "Enter  not this disc?      Esc back" end
+  text(a, M.x0 + M.pad, M.y1 - M.foot_h, 7, M.fs_small, COL.dim, hint)
 end
 
 local function draw_osd(a)
@@ -1219,6 +1430,11 @@ render = function()
     menu  = ui.stack[#ui.stack] or "",
     disc  = disc_label,
     rows  = #ui.rows,
+    sel   = (function()
+      local id = ui.stack[#ui.stack]
+      local r  = id and ui.rows[ui.sel[id] or 1]
+      return r and r.label or ""
+    end)(),
   })
   -- The cover belongs to the info screen alone. Anywhere else it would sit on
   -- top of the film, because a bitmap overlay is not part of the ASS layer we
@@ -1279,6 +1495,12 @@ end
 
 local function activate()
   local id = ui.stack[#ui.stack] or "main"
+  -- The info screen draws itself rather than a row list, so Enter there means
+  -- the one action it offers.
+  if id == "info" then
+    if #candidates > 0 then open_menu("pick") end
+    return
+  end
   local row = ui.rows[ui.sel[id] or 1]
   if not row or row.off then return end
   if row.sub then open_menu(row.sub); return end
@@ -1293,7 +1515,7 @@ local function activate()
   end
 end
 
-local function back()
+back = function()
   -- There is nothing behind the no-disc screen; closing it would leave a black
   -- screen and no way back.
   if ui.stack[1] == "nodisc" then return end
